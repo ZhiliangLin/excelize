@@ -1629,31 +1629,100 @@ func (ws *xlsxWorksheet) mergeCellsParser(cell string) (string, error) {
 	if err != nil {
 		return cell, err
 	}
-	if ws.MergeCells != nil {
-		for i := 0; i < len(ws.MergeCells.Cells); i++ {
-			if ws.MergeCells.Cells[i] == nil {
-				ws.MergeCells.Cells = append(ws.MergeCells.Cells[:i], ws.MergeCells.Cells[i+1:]...)
-				i--
-				continue
-			}
-			if ref := ws.MergeCells.Cells[i].Ref; len(ws.MergeCells.Cells[i].rect) == 0 && ref != "" {
-				if strings.Count(ref, ":") != 1 {
-					ref += ":" + ref
-				}
-				rect, err := rangeRefToCoordinates(ref)
-				if err != nil {
-					return cell, err
-				}
-				_ = sortCoordinates(rect)
-				ws.MergeCells.Cells[i].rect = rect
-			}
-			if cellInRange([]int{col, row}, ws.MergeCells.Cells[i].rect) {
-				cell = strings.Split(ws.MergeCells.Cells[i].Ref, ":")[0]
-				break
-			}
+	if ws.MergeCells == nil || len(ws.MergeCells.Cells) == 0 {
+		return cell, nil
+	}
+	if err = ws.mergeIndexParser(); err != nil {
+		return cell, err
+	}
+	// Single-row merge ranges are indexed by their row; multi-row ranges
+	// are rare, so they are checked linearly.
+	for _, mergeCell := range ws.mergeIndex[row] {
+		if cellInRange([]int{col, row}, mergeCell.rect) {
+			return strings.Split(mergeCell.Ref, ":")[0], nil
+		}
+	}
+	for _, mergeCell := range ws.mergeTall {
+		if cellInRange([]int{col, row}, mergeCell.rect) {
+			return strings.Split(mergeCell.Ref, ":")[0], nil
 		}
 	}
 	return cell, nil
+}
+
+// mergeIndexParser parses the references of the worksheet's merge cells and
+// builds the row-keyed index used by mergeCellsParser. It also parses the
+// cached rectangles of every merge range and drops nil entries from the
+// merge cells list, which the linear scan used to do on every call. The
+// index is built at most once between changes to the merge cells; callers
+// that change ws.MergeCells must call invalidateMergeIndex afterwards, so
+// that the next call rebuilds it. This turns the cost of every subsequent
+// cell write from O(number of merge ranges) into nearly O(1), which keeps
+// worksheets with tens of thousands of merged cells usable.
+func (ws *xlsxWorksheet) mergeIndexParser() error {
+	if ws.mergeIndexOK {
+		return nil
+	}
+	var (
+		index = make(map[int][]*xlsxMergeCell)
+		tall  []*xlsxMergeCell
+		cells = make([]*xlsxMergeCell, 0, len(ws.MergeCells.Cells))
+	)
+	for _, mergeCell := range ws.MergeCells.Cells {
+		if mergeCell == nil {
+			continue
+		}
+		if len(mergeCell.rect) == 0 && mergeCell.Ref != "" {
+			ref := mergeCell.Ref
+			if strings.Count(ref, ":") != 1 {
+				ref += ":" + ref
+			}
+			rect, err := rangeRefToCoordinates(ref)
+			if err != nil {
+				return err
+			}
+			_ = sortCoordinates(rect)
+			mergeCell.rect = rect
+		}
+		if len(mergeCell.rect) != 4 {
+			continue
+		}
+		cells = append(cells, mergeCell)
+		if mergeCell.rect[1] == mergeCell.rect[3] {
+			index[mergeCell.rect[1]] = append(index[mergeCell.rect[1]], mergeCell)
+			continue
+		}
+		tall = append(tall, mergeCell)
+	}
+	ws.MergeCells.Cells = cells
+	ws.MergeCells.Count = len(cells)
+	ws.mergeIndex, ws.mergeTall, ws.mergeIndexOK = index, tall, true
+	return nil
+}
+
+// invalidateMergeIndex drops the cached merge cells index of the worksheet
+// so that the next mergeCellsParser call rebuilds it. It must be called
+// after every change to ws.MergeCells other than appending a new range,
+// which indexMergeCell handles incrementally.
+func (ws *xlsxWorksheet) invalidateMergeIndex() {
+	ws.mergeIndex, ws.mergeTall, ws.mergeIndexOK = nil, nil, false
+}
+
+// indexMergeCell adds a single merge range to the cached merge cells index
+// without rebuilding it, keeping mergeCellsParser lookups fast while ranges
+// are appended one by one. When the index has not been built yet, the range
+// is picked up by the next rebuild instead. Only safe for ranges whose rect
+// is already parsed and whose entry has just been appended to
+// ws.MergeCells.Cells.
+func (ws *xlsxWorksheet) indexMergeCell(mergeCell *xlsxMergeCell) {
+	if !ws.mergeIndexOK || len(mergeCell.rect) != 4 {
+		return
+	}
+	if mergeCell.rect[1] == mergeCell.rect[3] {
+		ws.mergeIndex[mergeCell.rect[1]] = append(ws.mergeIndex[mergeCell.rect[1]], mergeCell)
+		return
+	}
+	ws.mergeTall = append(ws.mergeTall, mergeCell)
 }
 
 // checkCellInRangeRef provides a function to determine if a given cell reference

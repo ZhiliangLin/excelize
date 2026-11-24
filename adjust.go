@@ -95,6 +95,7 @@ func (f *File) adjustHelper(sheet string, dir adjustDirection, num, offset int) 
 	}
 	if ws.MergeCells != nil && len(ws.MergeCells.Cells) == 0 {
 		ws.MergeCells = nil
+		ws.invalidateMergeIndex()
 	}
 	return nil
 }
@@ -783,6 +784,7 @@ func (f *File) adjustMergeCells(ws *xlsxWorksheet, sheet string, dir adjustDirec
 			return err
 		}
 	}
+	ws.invalidateMergeIndex()
 	return nil
 }
 
@@ -820,6 +822,7 @@ func (f *File) deleteMergeCell(ws *xlsxWorksheet, idx int) {
 	if len(ws.MergeCells.Cells) > idx {
 		ws.MergeCells.Cells = append(ws.MergeCells.Cells[:idx], ws.MergeCells.Cells[idx+1:]...)
 		ws.MergeCells.Count = len(ws.MergeCells.Cells)
+		ws.invalidateMergeIndex()
 	}
 }
 

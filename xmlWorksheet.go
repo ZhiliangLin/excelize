@@ -63,6 +63,16 @@ type xlsxWorksheet struct {
 	TableParts             *xlsxTableParts              `xml:"tableParts"`
 	ExtLst                 *xlsxExtLst                  `xml:"extLst"`
 	DecodeAlternateContent *xlsxInnerXML                `xml:"http://schemas.openxmlformats.org/markup-compatibility/2006 AlternateContent"`
+	// mergeIndex caches the merge ranges of this worksheet keyed by their
+	// top row so that mergeCellsParser finds the range which contains a
+	// given cell without scanning every merge range. mergeTall holds the
+	// ranges spanning more than one row, which are rare, for a linear
+	// scan. mergeIndexOK reports whether the cached index is valid; it is
+	// reset by invalidateMergeIndex whenever the merge cells change. None
+	// of these fields is part of the worksheet XML.
+	mergeIndex   map[int][]*xlsxMergeCell `xml:"-"`
+	mergeTall    []*xlsxMergeCell         `xml:"-"`
+	mergeIndexOK bool                     `xml:"-"`
 }
 
 // xlsxDrawing change r:id to rid in the namespace.

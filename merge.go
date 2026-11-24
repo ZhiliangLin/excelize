@@ -11,7 +11,10 @@
 
 package excelize
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Rect gets merged cell rectangle coordinates sequence.
 func (mc *xlsxMergeCell) Rect() ([]int, error) {
@@ -79,9 +82,16 @@ func (f *File) MergeCell(sheet, topLeftCell, bottomRightCell string) error {
 	}
 	ref := topLeftCell + ":" + bottomRightCell
 	if ws.MergeCells != nil {
-		ws.MergeCells.Cells = append(ws.MergeCells.Cells, &xlsxMergeCell{Ref: ref, rect: rect})
+		mergeCell := &xlsxMergeCell{Ref: ref, rect: rect}
+		ws.MergeCells.Cells = append(ws.MergeCells.Cells, mergeCell)
+		// Extend the cached merge index incrementally instead of dropping
+		// it: rebuilding on every append would make writes that are
+		// interleaved with merges quadratic again.
+		ws.indexMergeCell(mergeCell)
 	} else {
-		ws.MergeCells = &xlsxMergeCells{Cells: []*xlsxMergeCell{{Ref: ref, rect: rect}}}
+		mergeCell := &xlsxMergeCell{Ref: ref, rect: rect}
+		ws.MergeCells = &xlsxMergeCells{Cells: []*xlsxMergeCell{mergeCell}}
+		ws.indexMergeCell(mergeCell)
 	}
 	ws.MergeCells.Count = len(ws.MergeCells.Cells)
 	return err
@@ -129,6 +139,7 @@ func (f *File) UnmergeCell(sheet, topLeftCell, bottomRightCell string) error {
 	if ws.MergeCells.Count == 0 {
 		ws.MergeCells = nil
 	}
+	ws.invalidateMergeIndex()
 	return nil
 }
 
@@ -172,12 +183,19 @@ func (f *File) GetMergeCells(sheet string, withoutValues ...bool) ([]MergeCell, 
 	return mergeCells, err
 }
 
+// sweepEvent represents an endpoint of a merged cell rectangle along the y
+// axis at which the rectangle enters or leaves the active set of the sweep.
+type sweepEvent struct {
+	y   int
+	idx int
+	in  bool
+}
+
 // mergeOverlapCells merge overlap cells.
 func (ws *xlsxWorksheet) mergeOverlapCells() error {
 	var (
 		err      error
 		rectList [][]int
-		merged   = true
 	)
 	for _, cell := range ws.MergeCells.Cells {
 		if cell == nil {
@@ -188,40 +206,203 @@ func (ws *xlsxWorksheet) mergeOverlapCells() error {
 		}
 		rectList = append(rectList, cell.rect)
 	}
-	for merged {
-		merged = false
-		var mergedRectList [][]int
-		used := make([]bool, len(rectList))
-		for i := 0; i < len(rectList); i++ {
-			if used[i] {
-				continue
-			}
-			r1 := rectList[i]
-			for j := i + 1; j < len(rectList); j++ {
-				if used[j] {
-					continue
-				}
-				if r2 := rectList[j]; isOverlap(r1, r2) {
-					r1 = []int{
-						min(r1[0], r2[0]),
-						min(r1[1], r2[1]),
-						max(r1[2], r2[2]),
-						max(r1[3], r2[3]),
-					}
-					merged, used[j] = true, true
-				}
-			}
-			mergedRectList = append(mergedRectList, r1)
-		}
-		rectList = mergedRectList
-	}
+	rectList = mergeRectList(rectList)
 	ws.MergeCells.Cells = make([]*xlsxMergeCell, 0, len(rectList))
 	for _, r := range rectList {
 		ref, _ := coordinatesToRangeRef(r)
 		ws.MergeCells.Cells = append(ws.MergeCells.Cells, &xlsxMergeCell{Ref: ref, rect: r})
 	}
 	ws.MergeCells.Count = len(ws.MergeCells.Cells)
+	ws.invalidateMergeIndex()
 	return err
+}
+
+// mergeRectList merges all overlapping rectangles in the given list until no
+// rectangle overlaps another, and returns the merged rectangles in ascending
+// order of the index of their surviving member, just as the plain quadratic
+// pairwise scan does. Instead of comparing every pair of rectangles, each
+// pass sweeps the plane row band by row band: rectangles that are active in
+// the same band share at least one row, so only those that also chain
+// together along the x axis are examined pairwise. This reduces the overall
+// complexity from quadratic in the number of rectangles to nearly linear for
+// the common case of non-overlapping merge ranges.
+func mergeRectList(rectList [][]int) [][]int {
+	if len(rectList) == 0 {
+		return nil
+	}
+	if len(rectList) < 2 {
+		return rectList
+	}
+	var (
+		work     = make([][]int, len(rectList))
+		consumed = make([]bool, len(rectList))
+		merged   = true
+	)
+	copy(work, rectList)
+	for merged {
+		merged = sweepMergeRects(work, consumed)
+	}
+	result := make([][]int, 0, len(work))
+	for i, r := range work {
+		if !consumed[i] {
+			result = append(result, r)
+		}
+	}
+	return result
+}
+
+// sweepMergeRects performs a single sweep pass over the rectangles that have
+// not been merged into another one yet, merging every overlapping pair that
+// is active in the same row band, and reports whether any rectangle has been
+// merged. Overlapping rectangles always share a row, so every pair that the
+// quadratic scan would merge is co-active in the band that contains that
+// row. Merged rectangles may grow so that they overlap rectangles which are
+// active in other bands; such pairs are caught by the following passes.
+func sweepMergeRects(work [][]int, consumed []bool) bool {
+	var count int
+	for i := range work {
+		if !consumed[i] {
+			count++
+		}
+	}
+	events := make([]sweepEvent, 0, 2*count)
+	for i, r := range work {
+		if consumed[i] {
+			continue
+		}
+		events = append(events, sweepEvent{y: r[1], idx: i, in: true}, sweepEvent{y: r[3] + 1, idx: i, in: false})
+	}
+	// Sort the events by row, letting exits come before enters at the same
+	// row so rectangles that only touch vertically are never co-active.
+	sort.Slice(events, func(a, b int) bool {
+		if events[a].y != events[b].y {
+			return events[a].y < events[b].y
+		}
+		return !events[a].in
+	})
+	var (
+		active  []int // indices of the rectangles of the current band, sorted by left edge
+		scratch = make([]int, 0, count)
+		run     []int // indices of the rectangles of the current chain
+		exited  = make([]bool, len(work))
+		goneN   int // number of stale entries in active
+		aliveN  int // number of entered and not yet exited rectangles
+		merged  bool
+	)
+	for ei := 0; ei < len(events); {
+		// Apply all events at the same row.
+		y, entered := events[ei].y, 0
+		for ; ei < len(events) && events[ei].y == y; ei++ {
+			e := events[ei]
+			if e.in {
+				active = append(active, e.idx)
+				aliveN, entered = aliveN+1, entered+1
+				continue
+			}
+			exited[e.idx], aliveN, goneN = true, aliveN-1, goneN+1
+		}
+		// Compact stale entries from active once they pile up, so that the
+		// band scan below stays proportional to the live rectangles.
+		if goneN > 0 && goneN*2 >= len(active) {
+			kept := active[:0]
+			for _, idx := range active {
+				if !exited[idx] && !consumed[idx] {
+					kept = append(kept, idx)
+				}
+			}
+			active, goneN = kept, 0
+		}
+		// Merge the newly entered rectangles into the sorted active set.
+		if entered > 0 {
+			head := len(active) - entered
+			suffix := active[head:]
+			sort.Slice(suffix, func(a, b int) bool {
+				return work[suffix[a]][0] < work[suffix[b]][0]
+			})
+			if head > 0 {
+				scratch = scratch[:0]
+				i, j := 0, head
+				for i < head && j < len(active) {
+					if work[active[j]][0] < work[active[i]][0] {
+						scratch = append(scratch, active[j])
+						j++
+						continue
+					}
+					scratch = append(scratch, active[i])
+					i++
+				}
+				scratch = append(scratch, active[i:head]...)
+				scratch = append(scratch, active[j:]...)
+				copy(active, scratch)
+			}
+		}
+		if aliveN < 2 {
+			continue
+		}
+		// Every active rectangle spans the current row, so overlaps can only
+		// occur between rectangles whose column ranges chain together. Split
+		// them into such chains and merge each one.
+		runMaxX2, run := 0, run[:0]
+		for _, idx := range active {
+			if exited[idx] || consumed[idx] {
+				continue
+			}
+			x1, x2 := work[idx][0], work[idx][2]
+			if len(run) > 0 && x1 > runMaxX2 {
+				if n := mergeRunRects(work, consumed, run); n > 0 {
+					merged, goneN = true, goneN+n
+				}
+				run = run[:0]
+			}
+			if len(run) == 0 {
+				runMaxX2 = x2
+			} else if x2 > runMaxX2 {
+				runMaxX2 = x2
+			}
+			run = append(run, idx)
+		}
+		if len(run) > 1 {
+			if n := mergeRunRects(work, consumed, run); n > 0 {
+				merged, goneN = true, goneN+n
+			}
+		}
+	}
+	return merged
+}
+
+// mergeRunRects merges the overlapping rectangles of a single chain, scanning
+// them in ascending index order exactly like the quadratic scan does, so the
+// surviving rectangle of every merged group keeps the lowest index of its
+// members. It returns the number of rectangles that have been merged into
+// another one.
+func mergeRunRects(work [][]int, consumed []bool, run []int) int {
+	if len(run) < 2 {
+		return 0
+	}
+	sort.Ints(run)
+	var absorbed int
+	for a := 0; a < len(run); a++ {
+		ia := run[a]
+		if consumed[ia] {
+			continue
+		}
+		for b := a + 1; b < len(run); b++ {
+			ib := run[b]
+			if consumed[ib] {
+				continue
+			}
+			if isOverlap(work[ia], work[ib]) {
+				work[ia] = []int{
+					min(work[ia][0], work[ib][0]),
+					min(work[ia][1], work[ib][1]),
+					max(work[ia][2], work[ib][2]),
+					max(work[ia][3], work[ib][3]),
+				}
+				absorbed, consumed[ib] = absorbed+1, true
+			}
+		}
+	}
+	return absorbed
 }
 
 // MergeCell define a merged cell data.
